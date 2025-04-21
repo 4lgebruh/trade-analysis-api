@@ -1,11 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
-import os
-import supabase
 import random
 from datetime import datetime
+import os
+import httpx
 
 # Initialize FastAPI app
 app = FastAPI(title="Trade Analysis API")
@@ -13,21 +13,11 @@ app = FastAPI(title="Trade Analysis API")
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Initialize Supabase client
-def get_supabase_client():
-    supabase_url = os.environ.get("SUPABASE_URL")
-    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
-    
-    if not supabase_url or not supabase_key:
-        raise HTTPException(status_code=500, detail="Missing Supabase credentials")
-    
-    return supabase.create_client(supabase_url, supabase_key)
 
 # Data models
 class Message(BaseModel):
@@ -46,18 +36,43 @@ class TradeAnalysisResult(BaseModel):
     weaknesses: List[str]
     suggestions: List[str]
 
-# Helper function to extract user ID from Authorization header
-async def get_user_id(request: Request):
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+# Simple function to make Supabase REST API calls
+async def query_supabase(endpoint, method="GET", body=None, user_id=None):
+    supabase_url = os.environ.get("SUPABASE_URL")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
     
-    # In a real implementation, validate the token with Supabase
-    # For now, we'll just extract the user ID from the request body
-    return None  # Will be overridden by the request body
+    if not supabase_url or not supabase_key:
+        raise HTTPException(status_code=500, detail="Missing Supabase credentials")
+    
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Add user_id filter if provided
+    query_params = ""
+    if user_id and method == "GET":
+        query_params = f"?user_id=eq.{user_id}"
+    
+    url = f"{supabase_url}/rest/v1/{endpoint}{query_params}"
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            if method == "GET":
+                response = await client.get(url, headers=headers)
+            elif method == "POST":
+                response = await client.post(url, headers=headers, json=body)
+            
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Helper function to analyze trades
-def analyze_trades(trades) -> TradeAnalysisResult:
+def analyze_trades(trades):
     if not trades:
         return TradeAnalysisResult(
             win_rate=0.0,
@@ -121,45 +136,42 @@ def analyze_trades(trades) -> TradeAnalysisResult:
         suggestions=suggestions
     )
 
-# Generate trading coach response using rules instead of ML
-def generate_coach_response(user_message: str, trade_analysis: TradeAnalysisResult) -> str:
+# Generate trading coach response
+def generate_coach_response(user_message, analysis):
     # Dictionary of pre-crafted responses for different topics
     responses = {
         "win_rate": [
-            f"Your win rate is {trade_analysis.win_rate:.1%}. " + 
-            ("This is above the 50% mark, which is great! " if trade_analysis.win_rate > 0.5 else 
+            f"Your win rate is {analysis.win_rate:.1%}. " + 
+            ("This is above the 50% mark, which is great! " if analysis.win_rate > 0.5 else 
              "This is below 50%, but remember that with a good risk-reward ratio, you can still be profitable. ") +
             "Focus on the quality of your setups rather than quantity.",
             
-            f"Based on your trading history, you're winning {trade_analysis.win_rate:.1%} of the time. " +
+            f"Based on your trading history, you're winning {analysis.win_rate:.1%} of the time. " +
             "Remember that even the best traders don't win every trade. " +
             "The key is to ensure your winners are bigger than your losers."
         ],
-        
         "improvement": [
-            f"To improve your trading results, I recommend focusing on these key areas: {', '.join(trade_analysis.suggestions[:2])}. " +
+            f"To improve your trading results, I recommend focusing on these key areas: {', '.join(analysis.suggestions[:2])}. " +
             "Keep a detailed trading journal and review it weekly to identify patterns.",
             
             "The path to improvement starts with consistency and discipline. " +
-            f"Based on your trades, I suggest working on: {', '.join(trade_analysis.suggestions[:2])}. " +
+            f"Based on your trades, I suggest working on: {', '.join(analysis.suggestions[:2])}. " +
             "Consider setting specific, measurable goals for each trading session."
         ],
-        
         "strengths": [
-            f"Your strengths as a trader include: {', '.join(trade_analysis.strengths)}. " +
+            f"Your strengths as a trader include: {', '.join(analysis.strengths)}. " +
             "Continue to build on these while addressing your areas for improvement.",
             
-            f"You're doing well with {', '.join(trade_analysis.strengths)}. " +
+            f"You're doing well with {', '.join(analysis.strengths)}. " +
             "These are solid foundations to build upon. Consider focusing next on your risk management approach."
         ],
-        
         "default": [
-            f"Looking at your trading data with a win rate of {trade_analysis.win_rate:.1%} and average P&L of ${trade_analysis.avg_profit_loss:.2f}, " +
-            f"I recommend focusing on: {', '.join(trade_analysis.suggestions[:2])}. " +
+            f"Looking at your trading data with a win rate of {analysis.win_rate:.1%} and average P&L of ${analysis.avg_profit_loss:.2f}, " +
+            f"I recommend focusing on: {', '.join(analysis.suggestions[:2])}. " +
             "Would you like more specific advice on a particular aspect of your trading?",
             
             "Based on your trading history, I see both strengths and areas for improvement. " +
-            f"Your win rate is {trade_analysis.win_rate:.1%}, and I'd suggest focusing on {trade_analysis.suggestions[0] if trade_analysis.suggestions else 'maintaining a trading journal'}. " +
+            f"Your win rate is {analysis.win_rate:.1%}, and I'd suggest focusing on {analysis.suggestions[0] if analysis.suggestions else 'maintaining a trading journal'}. " +
             "What specific aspect of your trading would you like to discuss?"
         ]
     }
@@ -177,12 +189,11 @@ def generate_coach_response(user_message: str, trade_analysis: TradeAnalysisResu
     return random.choice(responses[category])
 
 # Endpoint to get trade statistics
-@app.get("/api/trade-analysis", response_model=TradeAnalysisResult)
-async def get_trade_analysis(user_id: str, supabase = Depends(get_supabase_client)):
+@app.get("/api/trade-analysis")
+async def get_trade_analysis(user_id: str):
     try:
         # Query trades for the user
-        response = supabase.table("trades").select("*").eq("user_id", user_id).execute()
-        trades = response.data
+        trades = await query_supabase("trades", user_id=user_id)
         
         # Analyze the trades
         analysis = analyze_trades(trades)
@@ -192,7 +203,7 @@ async def get_trade_analysis(user_id: str, supabase = Depends(get_supabase_clien
 
 # Chat endpoint
 @app.post("/api/chat")
-async def chat(request: ChatRequest, supabase = Depends(get_supabase_client)):
+async def chat(request: ChatRequest):
     try:
         # Get the last user message
         last_message = None
@@ -205,8 +216,7 @@ async def chat(request: ChatRequest, supabase = Depends(get_supabase_client)):
             return {"response": "I didn't receive a message to respond to."}
         
         # Get trades for analysis
-        response = supabase.table("trades").select("*").eq("user_id", request.user_id).execute()
-        trades = response.data
+        trades = await query_supabase("trades", user_id=request.user_id)
         
         # Analyze trades
         analysis = analyze_trades(trades)
@@ -219,14 +229,9 @@ async def chat(request: ChatRequest, supabase = Depends(get_supabase_client)):
             "analysis": analysis.dict()
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
+        return {"response": f"Error processing your request: {str(e)}. Please try again later."}
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-# For local development
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()} 
