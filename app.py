@@ -4,8 +4,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import os
 import supabase
-from transformers import pipeline, set_seed
-import numpy as np
+import random
 from datetime import datetime
 
 # Initialize FastAPI app
@@ -29,18 +28,6 @@ def get_supabase_client():
         raise HTTPException(status_code=500, detail="Missing Supabase credentials")
     
     return supabase.create_client(supabase_url, supabase_key)
-
-# Initialize text generation pipeline with distilGPT2
-# Using a smaller model to fit within free tier RAM limits
-generator = None
-try:
-    print("Loading language model...")
-    generator = pipeline('text-generation', model='distilgpt2')
-    set_seed(42)  # For reproducibility
-    print("Language model loaded successfully!")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    print("Will use fallback response generation")
 
 # Data models
 class Message(BaseModel):
@@ -134,58 +121,60 @@ def analyze_trades(trades) -> TradeAnalysisResult:
         suggestions=suggestions
     )
 
-# Generate trading coach response - use fallback if model fails to load
+# Generate trading coach response using rules instead of ML
 def generate_coach_response(user_message: str, trade_analysis: TradeAnalysisResult) -> str:
-    # If model failed to load, return a fallback response
-    if generator is None:
-        # Structured fallback response based on analysis
-        if "win rate" in user_message.lower():
-            return f"Your win rate is {trade_analysis.win_rate:.1%}. " + \
-                   ("This is above average, good work!" if trade_analysis.win_rate > 0.5 else 
-                    "This is below 50%, but remember that a good risk-reward ratio can still make you profitable.")
-        
-        if "improve" in user_message.lower() or "better" in user_message.lower():
-            return "To improve your trading, focus on these areas: " + \
-                   ", ".join(trade_analysis.suggestions) + \
-                   ". Regular review of your trades is key to improvement."
-                   
-        # Default response
-        return "Based on your trading performance, I recommend focusing on: " + \
-               ", ".join(trade_analysis.suggestions[:2]) + \
-               ". Would you like more specific advice on a particular aspect?"
-    
-    # Create a prompt based on the analysis and user message
-    prompt = f"""
-You are a professional trading coach giving advice to a trader.
-The trader's performance:
-- Win rate: {trade_analysis.win_rate:.1%}
-- Average P&L: ${trade_analysis.avg_profit_loss:.2f}
-- Strategies used: {', '.join(trade_analysis.strategies) if trade_analysis.strategies else 'None recorded'}
-- Strengths: {', '.join(trade_analysis.strengths) if trade_analysis.strengths else 'None identified'}
-- Weaknesses: {', '.join(trade_analysis.weaknesses) if trade_analysis.weaknesses else 'None identified'}
-
-The trader asks: "{user_message}"
-
-Your helpful advice:
-"""
-    
-    try:
-        # Generate response (with max length limit to control token usage)
-        sequences = generator(prompt, max_length=150, num_return_sequences=1)
-        generated_text = sequences[0]['generated_text']
-        
-        # Extract just the advice part (after "Your helpful advice:")
-        advice_part = generated_text.split("Your helpful advice:")[-1].strip()
-        
-        # Clean up the response
-        if not advice_part or len(advice_part) < 10:
-            # Fallback if generation is too short or empty
-            return "Based on your trading performance, I recommend focusing on consistency and keeping detailed trade notes to identify patterns."
+    # Dictionary of pre-crafted responses for different topics
+    responses = {
+        "win_rate": [
+            f"Your win rate is {trade_analysis.win_rate:.1%}. " + 
+            ("This is above the 50% mark, which is great! " if trade_analysis.win_rate > 0.5 else 
+             "This is below 50%, but remember that with a good risk-reward ratio, you can still be profitable. ") +
+            "Focus on the quality of your setups rather than quantity.",
             
-        return advice_part
-    except Exception as e:
-        print(f"Error generating response: {e}")
-        return "I'm having trouble analyzing your trades right now. Please try again later."
+            f"Based on your trading history, you're winning {trade_analysis.win_rate:.1%} of the time. " +
+            "Remember that even the best traders don't win every trade. " +
+            "The key is to ensure your winners are bigger than your losers."
+        ],
+        
+        "improvement": [
+            f"To improve your trading results, I recommend focusing on these key areas: {', '.join(trade_analysis.suggestions[:2])}. " +
+            "Keep a detailed trading journal and review it weekly to identify patterns.",
+            
+            "The path to improvement starts with consistency and discipline. " +
+            f"Based on your trades, I suggest working on: {', '.join(trade_analysis.suggestions[:2])}. " +
+            "Consider setting specific, measurable goals for each trading session."
+        ],
+        
+        "strengths": [
+            f"Your strengths as a trader include: {', '.join(trade_analysis.strengths)}. " +
+            "Continue to build on these while addressing your areas for improvement.",
+            
+            f"You're doing well with {', '.join(trade_analysis.strengths)}. " +
+            "These are solid foundations to build upon. Consider focusing next on your risk management approach."
+        ],
+        
+        "default": [
+            f"Looking at your trading data with a win rate of {trade_analysis.win_rate:.1%} and average P&L of ${trade_analysis.avg_profit_loss:.2f}, " +
+            f"I recommend focusing on: {', '.join(trade_analysis.suggestions[:2])}. " +
+            "Would you like more specific advice on a particular aspect of your trading?",
+            
+            "Based on your trading history, I see both strengths and areas for improvement. " +
+            f"Your win rate is {trade_analysis.win_rate:.1%}, and I'd suggest focusing on {trade_analysis.suggestions[0] if trade_analysis.suggestions else 'maintaining a trading journal'}. " +
+            "What specific aspect of your trading would you like to discuss?"
+        ]
+    }
+    
+    # Determine which category the message falls into
+    category = "default"
+    if any(term in user_message.lower() for term in ["win rate", "winning", "success rate"]):
+        category = "win_rate"
+    elif any(term in user_message.lower() for term in ["improve", "better", "enhance", "increase", "boost"]):
+        category = "improvement"
+    elif any(term in user_message.lower() for term in ["strength", "good at", "excel", "positive"]):
+        category = "strengths"
+    
+    # Return a random response from the appropriate category
+    return random.choice(responses[category])
 
 # Endpoint to get trade statistics
 @app.get("/api/trade-analysis", response_model=TradeAnalysisResult)
@@ -235,7 +224,7 @@ async def chat(request: ChatRequest, supabase = Depends(get_supabase_client)):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "model_loaded": generator is not None}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 # For local development
 if __name__ == "__main__":
