@@ -32,12 +32,15 @@ def get_supabase_client():
 
 # Initialize text generation pipeline with distilGPT2
 # Using a smaller model to fit within free tier RAM limits
+generator = None
 try:
+    print("Loading language model...")
     generator = pipeline('text-generation', model='distilgpt2')
     set_seed(42)  # For reproducibility
+    print("Language model loaded successfully!")
 except Exception as e:
     print(f"Error loading model: {e}")
-    generator = None
+    print("Will use fallback response generation")
 
 # Data models
 class Message(BaseModel):
@@ -131,8 +134,26 @@ def analyze_trades(trades) -> TradeAnalysisResult:
         suggestions=suggestions
     )
 
-# Generate trading coach response using distilGPT2
+# Generate trading coach response - use fallback if model fails to load
 def generate_coach_response(user_message: str, trade_analysis: TradeAnalysisResult) -> str:
+    # If model failed to load, return a fallback response
+    if generator is None:
+        # Structured fallback response based on analysis
+        if "win rate" in user_message.lower():
+            return f"Your win rate is {trade_analysis.win_rate:.1%}. " + \
+                   ("This is above average, good work!" if trade_analysis.win_rate > 0.5 else 
+                    "This is below 50%, but remember that a good risk-reward ratio can still make you profitable.")
+        
+        if "improve" in user_message.lower() or "better" in user_message.lower():
+            return "To improve your trading, focus on these areas: " + \
+                   ", ".join(trade_analysis.suggestions) + \
+                   ". Regular review of your trades is key to improvement."
+                   
+        # Default response
+        return "Based on your trading performance, I recommend focusing on: " + \
+               ", ".join(trade_analysis.suggestions[:2]) + \
+               ". Would you like more specific advice on a particular aspect?"
+    
     # Create a prompt based on the analysis and user message
     prompt = f"""
 You are a professional trading coach giving advice to a trader.
@@ -149,10 +170,6 @@ Your helpful advice:
 """
     
     try:
-        # If model failed to load, return a fallback response
-        if generator is None:
-            return "I'm having trouble analyzing your trades right now. Please try again later."
-            
         # Generate response (with max length limit to control token usage)
         sequences = generator(prompt, max_length=150, num_return_sequences=1)
         generated_text = sequences[0]['generated_text']
@@ -218,7 +235,7 @@ async def chat(request: ChatRequest, supabase = Depends(get_supabase_client)):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "model_loaded": generator is not None}
 
 # For local development
 if __name__ == "__main__":
